@@ -438,45 +438,118 @@ def merge_vocab(vocab_counts: Dict[Tuple[bytes, ...], int], pair: Tuple[bytes, b
         vocab_counts[word] = vocab_counts.get(word, 0) + count
 
 
+def _merge_and_update_stats(
+    word_counts: Dict[Tuple[bytes, ...], int],
+    pair_counts: Dict[Tuple[bytes, bytes], int],
+    pair: Tuple[bytes, bytes],
+) -> None:
+    """
+    Apply merge of `pair` into word_counts and update pair_counts incrementally.
+
+    Instead of recomputing all pair counts from scratch each BPE iteration
+    (which is O(total_tokens) per step), only touches the words that actually
+    contain the merged pair -- O(words_with_pair * avg_word_length).
+    """
+    first, second = pair
+    merged_bytes = first + second
+
+    to_delete = []
+    to_add: Dict[Tuple[bytes, ...], int] = defaultdict(int)
+
+    for word_tuple, count in word_counts.items():
+        if first not in word_tuple:
+            continue
+
+        # Check whether the specific pair (first, second) appears adjacently
+        word_len = len(word_tuple)
+        found = False
+        for i in range(word_len - 1):
+            if word_tuple[i] == first and word_tuple[i + 1] == second:
+                found = True
+                break
+        if not found:
+            continue
+
+        # Subtract old pair contributions for this word
+        for j in range(word_len - 1):
+            pair_counts[(word_tuple[j], word_tuple[j + 1])] -= count
+
+        # Build the merged word
+        new_word: List[bytes] = []
+        i = 0
+        while i < word_len:
+            if i < word_len - 1 and word_tuple[i] == first and word_tuple[i + 1] == second:
+                new_word.append(merged_bytes)
+                i += 2
+            else:
+                new_word.append(word_tuple[i])
+                i += 1
+        new_word_tuple = tuple(new_word)
+
+        # Add new pair contributions for the merged word
+        for j in range(len(new_word_tuple) - 1):
+            pair_counts[(new_word_tuple[j], new_word_tuple[j + 1])] += count
+
+        to_delete.append(word_tuple)
+        to_add[new_word_tuple] += count
+
+    for word in to_delete:
+        del word_counts[word]
+    for word, count in to_add.items():
+        word_counts[word] = word_counts.get(word, 0) + count
+
+    # The merged pair no longer exists in the corpus
+    pair_counts.pop(pair, None)
+
+
 
 def _process_chunk(args):
     """
-    Worker function to process a file chunk and return word counts.
+    Process one byte-range of the file and return word counts.
+
+    Reads line-by-line within [start, end) so only one line is in memory at a
+    time instead of loading the entire chunk as bytes + decoded string at once.
     """
     input_path, start, end, special_tokens = args
 
     regex_pat = re.compile(GPT2_SPLIT_PATTERN)
+    special_pat = (
+        re.compile("|".join(re.escape(tok) for tok in special_tokens))
+        if special_tokens else None
+    )
 
-    # Read the chunk from file
+    word_counts: Dict[Tuple[bytes, ...], int] = defaultdict(int)
+
     with open(input_path, 'rb') as f:
         f.seek(start)
-        chunk_bytes = f.read(end - start)
+        bytes_remaining = end - start
 
-    # Decode the chunk
-    text = chunk_bytes.decode('utf-8', errors='ignore')
+        while bytes_remaining > 0:
+            line_bytes = f.readline()
+            if not line_bytes:
+                break
+            bytes_remaining -= len(line_bytes)
 
-    # Split by special tokens if needed
-    if special_tokens:
-        special_pat = re.compile("|".join(re.escape(tok) for tok in special_tokens))
-        chunks = []
-        last_end = 0
-        for match in special_pat.finditer(text):
-            s, e = match.span()
-            if s > last_end:
-                chunks.append(text[last_end:s])
-            last_end = e
-        if last_end < len(text):
-            chunks.append(text[last_end:])
-    else:
-        chunks = [text]
+            line = line_bytes.decode('utf-8', errors='ignore')
 
-    # Count words in this chunk
-    word_counts = defaultdict(int)
-    for chunk in chunks:
-        for match in regex_pat.finditer(chunk):
-            token_bytes = match.group().encode('utf-8')
-            word_tuple = tuple(_BYTE_TO_BYTES[b] for b in token_bytes)
-            word_counts[word_tuple] += 1
+            if special_pat:
+                parts = []
+                last_end = 0
+                for match in special_pat.finditer(line):
+                    s, e = match.span()
+                    if s > last_end:
+                        parts.append(line[last_end:s])
+                    last_end = e
+                if last_end < len(line):
+                    parts.append(line[last_end:])
+            else:
+                parts = [line]
+
+            for part in parts:
+                for match in regex_pat.finditer(part):
+                    token_bytes = match.group().encode('utf-8')
+                    word_tuple = tuple(_BYTE_TO_BYTES[b] for b in token_bytes)
+                    word_counts[word_tuple] += 1
 
     return dict(word_counts)
 
@@ -499,108 +572,60 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str] = None
 
     vocab = {i: _BYTE_TO_BYTES[i] for i in range(256)}
 
+    # Split the file into chunks bounded by special tokens, then process each
+    # chunk sequentially.  Only one chunk's decoded text lives in memory at a
+    # time, so peak RAM stays proportional to chunk_size rather than file_size.
+    num_chunks = mp.cpu_count()
 
-    # Check file size to decide whether to use multiprocessing
-    file_size = os.path.getsize(input_path)
-    use_multiprocessing = file_size > 10 * 1024 * 1024  # Use MP for files > 10MB
-
-    regex_pat = re.compile(GPT2_SPLIT_PATTERN)
-
-    if use_multiprocessing:
-        # Use multiprocessing for large files
-        num_processes = mp.cpu_count()
-
-        # Find chunk boundaries
-        with open(input_path, 'rb') as f:
-            if special_tokens:
-                # Use the first special token as the split token
-                split_token = special_tokens[0].encode('utf-8')
-                boundaries = find_chunk_boundaries(f, num_processes, split_token)
-            else:
-                # If no special tokens, just split uniformly
-                f.seek(0, os.SEEK_END)
-                file_size_bytes = f.tell()
-                chunk_size = file_size_bytes // num_processes
-                boundaries = [i * chunk_size for i in range(num_processes + 1)]
-                boundaries[-1] = file_size_bytes
-
-        # Create arguments for each worker
-        worker_args = [
-            (input_path, start, end, special_tokens)
-            for start, end in zip(boundaries[:-1], boundaries[1:])
-        ]
-
-        # Process chunks in parallel
-        with mp.Pool(num_processes) as pool:
-            chunk_results = pool.map(_process_chunk, worker_args)
-
-        # Merge results from all chunks
-        word_counts = defaultdict(int)
-        for chunk_counts in chunk_results:
-            for word_tuple, count in chunk_counts.items():
-                word_counts[word_tuple] += count
-        word_counts = dict(word_counts)
-    else:
-        # Use serial processing for small files (faster due to no MP overhead)
-        with open(input_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-
+    with open(input_path, 'rb') as f:
         if special_tokens:
-            # Split by special tokens
-            special_pat = re.compile("|".join(re.escape(tok) for tok in special_tokens))
-            chunks = []
-            last_end = 0
-            for match in special_pat.finditer(text):
-                start, end = match.span()
-                if start > last_end:
-                    chunks.append(text[last_end:start])
-                last_end = end
-            if last_end < len(text):
-                chunks.append(text[last_end:])
+            split_token = special_tokens[0].encode('utf-8')
+            boundaries = find_chunk_boundaries(f, num_chunks, split_token)
         else:
-            chunks = [text]
+            f.seek(0, os.SEEK_END)
+            fsize = f.tell()
+            chunk_sz = max(fsize // num_chunks, 1)
+            boundaries = sorted(set(
+                [i * chunk_sz for i in range(num_chunks)] + [fsize]
+            ))
 
-        word_counts = defaultdict(int)
-        for chunk in chunks:
-            for match in regex_pat.finditer(chunk):
-                token_bytes = match.group().encode('utf-8')
-                word_tuple = tuple(_BYTE_TO_BYTES[b] for b in token_bytes)
-                word_counts[word_tuple] += 1
-        word_counts = dict(word_counts)
+    word_counts: Dict[Tuple[bytes, ...], int] = defaultdict(int)
 
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        chunk_counts = _process_chunk((input_path, start, end, special_tokens))
+        for word_tuple, count in chunk_counts.items():
+            word_counts[word_tuple] += count
+        # chunk_counts goes out of scope here; its memory is released before
+        # the next chunk is read.
 
+    # Compute pair counts once upfront instead of rebuilding from scratch every
+    # BPE iteration (the old approach created and discarded a new dict each of
+    # the ~9700 iterations, causing major GC pressure and RAM spikes).
+    pair_counts = get_stats(word_counts)
 
     merges = []
 
-
-
     num_merges = vocab_size - 256 - len(special_tokens)
-
-
 
     for i in range(num_merges):
 
-        stats = get_stats(word_counts)
-
-        if not stats:
-
+        if not pair_counts:
             break
 
         # Use max with a tuple key for consistent tie-breaking
-        best_pair = max(stats.items(), key=lambda x: (x[1], x[0]))[0]
-
-
+        best_item = max(pair_counts.items(), key=lambda x: (x[1], x[0]))
+        if best_item[1] <= 0:
+            break
+        best_pair = best_item[0]
 
         merges.append(best_pair)
 
+        vocab[256 + i] = best_pair[0] + best_pair[1]
 
+        # Update word_counts AND pair_counts incrementally -- only touches words
+        # that contain the merged pair, not the entire corpus.
+        _merge_and_update_stats(word_counts, pair_counts, best_pair)
 
-        # New token ID
-
-        new_id = 256 + i
-
-        vocab[new_id] = best_pair[0] + best_pair[1]
-        merge_vocab(word_counts, best_pair)
     next_id = 256 + len(merges)
 
     for st in special_tokens:
