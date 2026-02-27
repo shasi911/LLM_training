@@ -25,12 +25,12 @@ except ImportError:
 
 def main():
     INPUT_FILE = "data/owt_train.txt"
-    VOCAB_SIZE = 10000
+    VOCAB_SIZE = 32000
     SPECIALS = ["<|endoftext|>"]
 
     # Output files
-    VOCAB_OUTPUT = "owt_vocab.json"
-    MERGES_OUTPUT = "owt_merges.json"
+    VOCAB_OUTPUT = "owt_vocab_32k.json"
+    MERGES_OUTPUT = "owt_merges_32k.json"
 
     print("=" * 60)
     print("Training BPE Tokenizer on OpenWebText")
